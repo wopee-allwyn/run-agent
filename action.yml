@@ -13,7 +13,11 @@ runs:
       shell: bash
       run: |
         echo "::group::WOPEE_ environment variables (initial)"
-        env | grep '^WOPEE_' | sort > /tmp/wopee_env_initial.txt
+        # Secrets are redacted at snapshot time: these files feed the job log AND the
+        # diagnostic webhook payload, so credential values must never land in them.
+        env | grep '^WOPEE_' | sort \
+          | sed -E 's/^(WOPEE_[A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_]*)=.+/\1=***REDACTED***/' \
+          > /tmp/wopee_env_initial.txt
         cat /tmp/wopee_env_initial.txt || echo "(none)"
         echo "::endgroup::"
 
@@ -80,6 +84,53 @@ runs:
             end
         ' "$GITHUB_EVENT_PATH" >> "$GITHUB_ENV"
 
+    # Bind this execution to its Actions run NOW, not at the end (backlog#4382).
+    #
+    # The api creates the ExecutedTestCase row before it fires repository_dispatch, but that
+    # POST returns 204 with no body — so the api never learns which Actions run picked the
+    # dispatch up. Until this step existed the pairing was only reported by postProcessAgentSuite
+    # once the run was already over. Callers had to guess their run out of a gh run list poll
+    # (racy the moment two dispatches overlap), the Logs tab sat on "pending" for the whole run,
+    # and a run that died before post-processing never reported the id at all.
+    #
+    # Deliberately best-effort: this is bookkeeping, and a test run must never fail because of
+    # it. continue-on-error covers a non-zero exit, the trailing || covers everything else.
+    - name: Attach GitHub Actions run to the execution
+      if: env.WOPEE_EXECUTED_TEST_CASE_UUID != '' && env.WOPEE_API_URL != ''
+      continue-on-error: true
+      shell: bash
+      run: |
+        QUERY='mutation($input: AttachAgentRunInput!) { attachAgentRun(input: $input) { ok attached } }'
+
+        JSON_PAYLOAD="$(jq -n \
+          --arg query "$QUERY" \
+          --arg executedTestCaseUuid "${WOPEE_EXECUTED_TEST_CASE_UUID}" \
+          --arg projectUuid "${WOPEE_PROJECT_UUID:-}" \
+          --arg githubRunId "${GITHUB_RUN_ID}" \
+          --argjson githubRunAttempt "${GITHUB_RUN_ATTEMPT:-1}" \
+          '{
+            query: $query,
+            variables: {
+              input: {
+                executedTestCaseUuid: $executedTestCaseUuid,
+                projectUuid: $projectUuid,
+                githubRunId: $githubRunId,
+                githubRunAttempt: $githubRunAttempt
+              }
+            }
+          }'
+        )"
+
+        curl --fail-with-body --silent --show-error \
+          --request POST --max-time 15 \
+          --retry 2 --retry-delay 2 \
+          --header "content-type: application/json" \
+          --header "api_key: ${WOPEE_API_KEY}" \
+          --header "projectuuid: ${WOPEE_PROJECT_UUID:-}" \
+          --url "${WOPEE_API_URL}" \
+          --data "$JSON_PAYLOAD" \
+          || echo "::warning::Could not attach run ${GITHUB_RUN_ID} to execution ${WOPEE_EXECUTED_TEST_CASE_UUID}; its log may be unreachable from Wopee."
+
     - name: Load .github/workflows/.env → $GITHUB_ENV
       shell: bash
       run: |
@@ -91,11 +142,13 @@ runs:
         fi
 
     - name: Install dependencies
+      # Project node_modules only. No `npx playwright install` here on purpose: agent
+      # runs execute pw-agent out of WOPEE_AGENT_WORK_DIR with the image-baked browsers
+      # (PLAYWRIGHT_BROWSERS_PATH), never the project's Playwright — downloading the
+      # project's browser build burned ~1.2 GB of /tmp tmpfs per run for nothing.
       shell: bash
       run: |
         npm install --prefer-offline --no-audit
-        npx playwright install
-        npx playwright install ffmpeg
 
     - name: Set analysis suite parameters & test case to run
       shell: bash
@@ -138,7 +191,10 @@ runs:
       shell: bash
       run: |
         echo "::group::WOPEE_ environment variables (pre-execution)"
-        env | grep '^WOPEE_' | sort > /tmp/wopee_env_pre_exec.txt
+        # Same redaction as the initial snapshot, so the diff below stays meaningful.
+        env | grep '^WOPEE_' | sort \
+          | sed -E 's/^(WOPEE_[A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_]*)=.+/\1=***REDACTED***/' \
+          > /tmp/wopee_env_pre_exec.txt
         cat /tmp/wopee_env_pre_exec.txt
         echo "::endgroup::"
 
@@ -179,7 +235,18 @@ runs:
             git -C "$WORK_DIR" log --oneline "$LOCAL_HEAD..$ORIGIN_MAIN" 2>/dev/null | head -5 || true
           fi
           echo "--- live fetch test ---"
-          FETCH_OUTPUT=$(git -C "$WORK_DIR" fetch --dry-run origin main 2>&1) && FETCH_STATUS="ok" || FETCH_STATUS="FAILED"
+          # Only meaningful when the repo itself carries credentials (baked extraheader).
+          # When auto-update runs with WOPEE_AGENT_AUTO_UPDATE_ACCESS_TOKEN, wopee_agent
+          # injects the token into the remote URL itself — an unauthenticated probe here
+          # would report FAILED on every run and mask real outages.
+          FETCH_OUTPUT=""
+          if git -C "$WORK_DIR" config --local --get-all http.https://github.com/.extraheader >/dev/null 2>&1; then
+            FETCH_OUTPUT=$(git -C "$WORK_DIR" fetch --dry-run origin main 2>&1) && FETCH_STATUS="ok" || FETCH_STATUS="FAILED"
+          elif [ -n "${WOPEE_AGENT_AUTO_UPDATE_ACCESS_TOKEN:-}" ]; then
+            FETCH_STATUS="SKIPPED_TOKEN_AUTH"
+          else
+            FETCH_STATUS="SKIPPED_NO_CREDS"
+          fi
           echo "fetch dry-run: $FETCH_STATUS"
           if [ "$FETCH_STATUS" = "FAILED" ]; then
             echo "$FETCH_OUTPUT"
@@ -204,8 +271,23 @@ runs:
         echo "::endgroup::"
 
         echo "::group::Playwright browsers"
-        npx playwright --version 2>/dev/null || echo "playwright CLI not available"
-        ls -la ~/.cache/ms-playwright/ 2>/dev/null || echo "No browsers in default cache"
+        echo "project: $(npx playwright --version 2>/dev/null || echo 'playwright CLI not available')"
+        echo "agent:   $(cd "$WORK_DIR" 2>/dev/null && npx --no-install playwright --version 2>/dev/null || echo 'unknown')"
+        BROWSERS_DIR="${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}"
+        ls -la "$BROWSERS_DIR" 2>/dev/null || echo "No browsers at $BROWSERS_DIR"
+        # WHICH binary interactive mode actually drives. In interactive runs the
+        # browser is shell-launched as `chrome` from PATH, not launched by
+        # Playwright, and that symlink is built in runtime/Dockerfile.base from a
+        # filesystem walk. Nothing has ever recorded what it resolves to, so
+        # "the agent drives the build Playwright was made against" has been an
+        # assumption for the life of the CDP path.
+        CHROME_BIN="$(command -v chrome 2>/dev/null || echo '')"
+        if [ -n "$CHROME_BIN" ]; then
+          echo "chrome on PATH: $CHROME_BIN -> $(readlink -f "$CHROME_BIN")"
+          echo "chrome --version: $("$CHROME_BIN" --version 2>/dev/null || echo 'unavailable')"
+        else
+          echo "chrome not on PATH (standard/headless mode launches via Playwright)"
+        fi
         echo "::endgroup::"
 
         echo "::group::Diagnostic fingerprint (JSON)"
@@ -218,6 +300,7 @@ runs:
           --arg lockfile_sha "$(sha256sum "$WORK_DIR/package-lock.json" 2>/dev/null | cut -d' ' -f1 || echo 'unknown')" \
           --arg pkg_version "$(jq -r '.version // "n/a"' "$WORK_DIR/package.json" 2>/dev/null || echo 'unknown')" \
           --arg pw_version "$(npx playwright --version 2>/dev/null || echo 'unknown')" \
+          --arg agent_pw_version "$(cd "$WORK_DIR" 2>/dev/null && npx --no-install playwright --version 2>/dev/null || echo 'unknown')" \
           --arg host_uptime "$(cut -d' ' -f1 /proc/uptime 2>/dev/null || echo 'unknown')" \
           --arg container_started "$(stat -c '%y' /proc/1 2>/dev/null || echo 'unknown')" \
           --arg container_age_sec "$(( $(date +%s) - $(stat -c '%Y' /proc/1 2>/dev/null || echo 0) ))" \
@@ -234,17 +317,23 @@ runs:
           --arg github_run_id "${GITHUB_RUN_ID:-unknown}" \
           --arg github_run_url "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-unknown}/actions/runs/${GITHUB_RUN_ID:-0}" \
           --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-          '{timestamp: $timestamp, hostname: $hostname, runner: $runner, github_run_id: $github_run_id, github_run_url: $github_run_url, agent_binary_sha256: $agent_sha, git_head: $head, git_origin_main: $git_origin_main, git_remote_url: $git_remote_url, git_extraheader: $git_extraheader, git_fetch_test: $git_fetch_test, git_fetch_error: $git_fetch_error, pkg_version: $pkg_version, lockfile_sha256: $lockfile_sha, playwright: $pw_version, host_uptime_sec: $host_uptime, container_started: $container_started, container_age_sec: $container_age_sec, disk_free: $disk_free, mem_mb: $mem_used, last_git_fetch: $last_fetch, env_vars_changed: $env_vars_changed, wopee_env: $wopee_env}')
+          '{timestamp: $timestamp, hostname: $hostname, runner: $runner, github_run_id: $github_run_id, github_run_url: $github_run_url, agent_binary_sha256: $agent_sha, git_head: $head, git_origin_main: $git_origin_main, git_remote_url: $git_remote_url, git_extraheader: $git_extraheader, git_fetch_test: $git_fetch_test, git_fetch_error: $git_fetch_error, pkg_version: $pkg_version, lockfile_sha256: $lockfile_sha, playwright: $pw_version, playwright_agent: $agent_pw_version, host_uptime_sec: $host_uptime, container_started: $container_started, container_age_sec: $container_age_sec, disk_free: $disk_free, mem_mb: $mem_used, last_git_fetch: $last_fetch, env_vars_changed: $env_vars_changed, wopee_env: $wopee_env}')
         echo "$DIAG_JSON"
         echo "::endgroup::"
 
         echo "::group::POST diagnostic fingerprint to webhook"
-        curl -s -o /dev/null -w "Webhook POST: HTTP %{http_code}\n" \
-          --request POST \
-          --header "content-type: application/json" \
-          --data "$DIAG_JSON" \
-          "https://hub.dev.wopee.io/webhook/cc8ece89-1349-4d95-a214-6e0f37214dca" \
-          || echo "Warning: webhook POST failed"
+        # Payload contains only redacted env (see the snapshot steps) plus non-secret
+        # fingerprints. Kill switch: set WOPEE_DIAG_WEBHOOK_DISABLED=true on the tenant.
+        if [ "${WOPEE_DIAG_WEBHOOK_DISABLED:-false}" = "true" ]; then
+          echo "Webhook POST skipped (WOPEE_DIAG_WEBHOOK_DISABLED=true)"
+        else
+          curl -s -o /dev/null -w "Webhook POST: HTTP %{http_code}\n" \
+            --request POST \
+            --header "content-type: application/json" \
+            --data "$DIAG_JSON" \
+            "https://hub.dev.wopee.io/webhook/cc8ece89-1349-4d95-a214-6e0f37214dca" \
+            || echo "Warning: webhook POST failed"
+        fi
         echo "::endgroup::"
 
     - name: Start Chrome with CDP
@@ -268,6 +357,15 @@ runs:
           if curl -sf http://127.0.0.1:9222/json/version >/dev/null; then break; fi
           sleep 0.3
         done
+
+        # The readiness probe already asks Chrome to identify itself and threw
+        # the answer away. It carries the browser build and the CDP protocol
+        # version — the two facts that say whether this browser is the one
+        # Playwright was built against, which no run has ever recorded.
+        echo "::group::Chrome identity"
+        curl -s http://127.0.0.1:9222/json/version || echo "could not read /json/version"
+        echo
+        echo "::endgroup::"
 
     - name: Register browser session with API relay
       if: env.AGENT_MODE == 'interactive'
